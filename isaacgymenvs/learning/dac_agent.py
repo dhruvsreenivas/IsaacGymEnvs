@@ -1,6 +1,7 @@
 # Stuff added by Dhruv Sreenivas for Discriminator Actor-Critic in the IsaacGym ILFO suite
 
 import rl_games.algos_torch.sac_agent as sac_agent
+from rl_games.interfaces.base_algorithm import BaseAlgorithm
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 from rl_games.algos_torch import torch_ext
 import torch
@@ -23,8 +24,84 @@ def dict_detach(info_dict: Mapping[str, torch.Tensor]):
 class DACAgent(sac_agent.SACAgent):
     '''Discriminator Actor-Critic agent.'''
     def __init__(self, base_name, params):
-        super().__init__(base_name, params)
+        # config setup
+        self.config = config = params['config']
+        print(config)
+
+        # =================== SAC INIT ===================
+        
+        # TODO: Get obs shape and self.network
+        super().load_networks(params)
+        super().base_init(base_name, config)
+        
+        # load AMP configs
         self._load_amp_config_params(self.config)
+        
+        self.num_warmup_steps = config["num_warmup_steps"]
+        self.gamma = config["gamma"]
+        self.critic_tau = config["critic_tau"]
+        self.batch_size = config["batch_size"]
+        self.init_alpha = config["init_alpha"]
+        self.learnable_temperature = config["learnable_temperature"]
+        self.replay_buffer_size = config["replay_buffer_size"]
+        self.num_steps_per_episode = config.get("num_steps_per_episode", 1)
+        self.normalize_input = config.get("normalize_input", False)
+
+        self.max_env_steps = config.get("max_env_steps", 1000) # temporary, in future we will use other approach
+
+        print(self.batch_size, self.num_actors, self.num_agents)
+
+        self.num_frames_per_epoch = self.num_actors * self.num_steps_per_episode
+
+        self.log_alpha = torch.tensor(np.log(self.init_alpha)).float().to(self._device)
+        self.log_alpha.requires_grad = True
+        action_space = self.env_info['action_space']
+        self.actions_num = action_space.shape[0]
+
+        self.action_range = [
+            float(self.env_info['action_space'].low.min()),
+            float(self.env_info['action_space'].high.max())
+        ]
+
+        obs_shape = torch_ext.shape_whc_to_cwh(self.obs_shape)
+        net_config = {
+            'obs_dim': self.env_info["observation_space"].shape[0],
+            'action_dim': self.env_info["action_space"].shape[0],
+            'actions_num' : self.actions_num,
+            'input_shape' : obs_shape,
+            'normalize_input' : self.normalize_input,
+            'normalize_input': self.normalize_input,
+            'amp_input_shape': self._amp_observation_space.shape
+        }
+        self.model = self.network.build(net_config)
+        self.model.to(self._device)
+
+        print("Number of Agents", self.num_actors, "Batch Size", self.batch_size)
+
+        self.actor_optimizer = torch.optim.Adam(self.model.sac_network.actor.parameters(),
+                                                lr=float(self.config['actor_lr']),
+                                                betas=self.config.get("actor_betas", [0.9, 0.999]))
+
+        self.critic_optimizer = torch.optim.Adam(self.model.sac_network.critic.parameters(),
+                                                 lr=float(self.config["critic_lr"]),
+                                                 betas=self.config.get("critic_betas", [0.9, 0.999]))
+
+        self.log_alpha_optimizer = torch.optim.Adam([self.log_alpha],
+                                                    lr=float(self.config["alpha_lr"]),
+                                                    betas=self.config.get("alphas_betas", [0.9, 0.999]))
+
+        self.target_entropy_coef = config.get("target_entropy_coef", 1.0)
+        self.target_entropy = self.target_entropy_coef * -self.env_info['action_space'].shape[0]
+        print("Target entropy", self.target_entropy)
+
+        self.step = 0
+        self.algo_observer = config['features']['observer']
+
+        # TODO: Is there a better way to get the maximum number of episodes?
+        self.max_episodes = torch.ones(self.num_actors, device=self._device)*self.num_steps_per_episode
+        # self.episode_lengths = np.zeros(self.num_actors, dtype=int)
+        
+        # ==================== FINALLY WE CAN ADD AMP STUFF IN ====================
         
         # add AMP input mean std
         if self._normalize_amp_input:
@@ -32,7 +109,7 @@ class DACAgent(sac_agent.SACAgent):
         
         # add discriminator optimizer (over both disc mlp and the disc logit final layer)
         assert isinstance(self.model.sac_network._disc_mlp, nn.Module) and isinstance(self.model.sac_network._disc_logits, nn.Module), "something went wrong in discriminator init"
-        disc_params = list(self.model._disc_mlp.parameters()) + list(self.model._disc_logits.parameters())
+        disc_params = list(self.model.sac_network._disc_mlp.parameters()) + list(self.model.sac_network._disc_logits.parameters())
         self.disc_optimizer = torch.optim.Adam(
             disc_params,
             lr=float(self.config['discriminator_lr']),
@@ -51,6 +128,29 @@ class DACAgent(sac_agent.SACAgent):
     def init_tensors(self):
         super().init_tensors()
         self._build_amp_buffers()
+        return
+    
+    def _init_amp_demo_buf(self):
+        '''Fills expert buffer to be full at the start of training.'''
+        buffer_size = self._amp_obs_demo_buffer.get_buffer_size()
+        num_batches = int(np.ceil(buffer_size / self.batch_size))
+
+        for i in range(num_batches):
+            curr_samples = self._fetch_amp_obs_demo(self.batch_size)
+            self._amp_obs_demo_buffer.store({'amp_obs': curr_samples})
+
+        return
+    
+    def set_eval(self):
+        super().set_eval()
+        if self._normalize_amp_input:
+            self._amp_input_mean_std.eval()
+        return
+
+    def set_train(self):
+        super().set_train()
+        if self._normalize_amp_input:
+            self._amp_input_mean_std.train()
         return
     
     def _load_amp_config_params(self, config):
@@ -128,6 +228,8 @@ class DACAgent(sac_agent.SACAgent):
             'discriminator_mlp': self.model.sac_network._disc_mlp.state_dict(),
             'discriminator_logits': self.model.sac_network._disc_logits.state_dict()
         }
+        if self._normalize_amp_input:
+            state.update({'amp_input_mean_std': self._amp_input_mean_std.state_dict()})
         return state
     
     def save(self, fn):
@@ -143,6 +245,9 @@ class DACAgent(sac_agent.SACAgent):
 
         if self.normalize_input and 'running_mean_std' in weights:
             self.model.running_mean_std.load_state_dict(weights['running_mean_std'])
+        
+        if self._normalize_amp_input and 'amp_input_mean_std' in weights:
+            self._amp_input_mean_std.load_state_dict(weights['amp_input_mean_std'])
 
     def set_full_state_weights(self, weights):
         self.set_weights(weights)
@@ -189,7 +294,7 @@ class DACAgent(sac_agent.SACAgent):
 
         # weight decay
         if (self._disc_weight_decay != 0):
-            disc_weights = self.model.a2c_network.get_disc_weights()
+            disc_weights = self.model.sac_network.get_disc_weights()
             disc_weights = torch.cat(disc_weights, dim=-1)
             disc_weight_decay = torch.sum(torch.square(disc_weights))
             disc_loss += self._disc_weight_decay * disc_weight_decay
@@ -214,16 +319,16 @@ class DACAgent(sac_agent.SACAgent):
         demo_acc = torch.mean(demo_acc.float())
         return agent_acc, demo_acc
 
+    @torch.no_grad()
     def _calc_disc_rewards(self, amp_obs, reward_type='amp'):
-        with torch.no_grad():
-            if reward_type == 'amp':
-                disc_logits = self.model.disc(amp_obs)
-                prob = 1 / (1 + torch.exp(-disc_logits))
-                disc_r = -torch.log(torch.maximum(1 - prob, torch.tensor(0.0001, device=self.ppo_device)))
-            else:
-                disc_r = disc_logits # AIRL reward
+        disc_logits = self.model.disc(amp_obs)
+        if reward_type == 'amp':
+            prob = 1 / (1 + torch.exp(-disc_logits))
+            disc_r = -torch.log(torch.maximum(1 - prob, torch.tensor(0.0001, device=self.ppo_device)))
+        else:
+            disc_r = disc_logits # AIRL reward
 
-            disc_r *= self._disc_reward_scale
+        disc_r *= self._disc_reward_scale
         return disc_r
 
     def _combine_rewards(self, task_rewards, amp_rewards):
@@ -233,6 +338,7 @@ class DACAgent(sac_agent.SACAgent):
     # new update fn
     def update_disc(self, replay_obs, expert_obs, step):
         del step
+        expert_obs.requires_grad_(True)
         
         replay_logits = self.model.disc(replay_obs)
         expert_logits = self.model.disc(expert_obs)
@@ -248,11 +354,24 @@ class DACAgent(sac_agent.SACAgent):
     def update(self, step):
         obs, action, reward, next_obs, done, rl_amp_replay_obs = self.replay_buffer.sample(self.batch_size)
         not_done = ~done
+        obs = self.preproc_obs(obs)
+        next_obs = self.preproc_obs(next_obs)
+        rl_amp_replay_obs = self._preproc_amp_obs(rl_amp_replay_obs)
+        
+        # update discriminator
+        amp_expert_obs = self._amp_obs_demo_buffer.sample(self.batch_size)
+        amp_expert_obs = amp_expert_obs['amp_obs']
+        amp_expert_obs = self._preproc_amp_obs(amp_expert_obs)
+        disc_info = self.update_disc(rl_amp_replay_obs, amp_expert_obs, step)
 
-        # update discriminator (TODO should i make new AMP buffer to make this better?)
-        for _ in range(self._num_disc_updates_per_ac_update):
+        for _ in range(self._num_disc_updates_per_ac_update - 1):
             _, _, _, _, _, amp_replay_obs = self.replay_buffer.sample(self.batch_size)
             amp_expert_obs = self._amp_obs_demo_buffer.sample(self.batch_size)
+            amp_expert_obs = amp_expert_obs['amp_obs']
+            
+            amp_replay_obs = self._preproc_amp_obs(amp_replay_obs)
+            amp_expert_obs = self._preproc_amp_obs(amp_expert_obs)
+            
             disc_info = self.update_disc(amp_replay_obs, amp_expert_obs, step)
 
         # update reward to account for discriminator stuff
@@ -260,8 +379,6 @@ class DACAgent(sac_agent.SACAgent):
         combined_reward = self._combine_rewards(reward, disc_reward)
 
         # update actor/critic
-        obs = self.preproc_obs(obs)
-        next_obs = self.preproc_obs(next_obs)
         critic_loss, critic1_loss, critic2_loss = self.update_critic(obs, action, combined_reward, next_obs, not_done, step)
 
         actor_loss, entropy, alpha, alpha_loss = self.update_actor_and_alpha(obs, step)
@@ -371,6 +488,10 @@ class DACAgent(sac_agent.SACAgent):
         # rep_count = 0
         self.frame = 0
         self.obs = self.env_reset()
+        
+        # initialize expert buffer as well
+        self._init_amp_demo_buf()
+        print('============ everything initialized and ready to go! ============')
 
         while True:
             self.epoch_num += 1
@@ -395,7 +516,8 @@ class DACAgent(sac_agent.SACAgent):
             # add pre rl stuff if it exists
             if len(disc_losses_pre_rl) > 0:
                 self.writer.add_scalar('losses/disc_loss_pre_rl', torch_ext.mean_list(disc_losses_pre_rl).item(), self.frame)
-
+            
+            # logging training
             if self.epoch_num >= self.num_warmup_steps:
                 self.writer.add_scalar('losses/a_loss', torch_ext.mean_list(actor_losses).item(), self.frame)
                 self.writer.add_scalar('losses/c1_loss', torch_ext.mean_list(critic1_losses).item(), self.frame)
@@ -412,6 +534,7 @@ class DACAgent(sac_agent.SACAgent):
             self.writer.add_scalar('info/epochs', self.epoch_num, self.frame)
             self.algo_observer.after_print_stats(self.frame, self.epoch_num, total_time)
 
+            # logging eval
             if self.game_rewards.current_size > 0:
                 mean_rewards = self.game_rewards.get_mean()
                 mean_lengths = self.game_lengths.get_mean()
@@ -441,16 +564,6 @@ class DACAgent(sac_agent.SACAgent):
                     self.save(os.path.join(self.nn_dir, 'last_' + self.config['name'] + '_ep_' + str(self.epoch_num) \
                         + '_rew_' + str(mean_rewards).replace('[', '_').replace(']', '_')))
                     print('MAX EPOCHS NUM!')
-                    should_exit = True
-
-                if self.frame >= self.max_frames and self.max_frames != -1:
-                    if self.game_rewards.current_size == 0:
-                        print('WARNING: Max frames reached before any env terminated at least once')
-                        mean_rewards = -np.inf
-
-                    self.save(os.path.join(self.nn_dir, 'last_' + self.config['name'] + '_frame_' + str(self.frame) \
-                        + '_rew_' + str(mean_rewards).replace('[', '_').replace(']', '_')))
-                    print('MAX FRAMES NUM!')
                     should_exit = True
 
                 update_time = 0

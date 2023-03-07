@@ -79,6 +79,7 @@ class Env(ABC):
             else:
                 print("GPU Pipeline can only be used with GPU simulation. Forcing CPU Pipeline.")
                 config["sim"]["use_gpu_pipeline"] = False
+                # config["sim"]["physx"]["use_gpu"] = False # DHRUV CHANGE
 
         self.rl_device = rl_device
 
@@ -327,19 +328,24 @@ class VecTask(Env):
         action_tensor = torch.clamp(actions, -self.clip_actions, self.clip_actions)
         # apply actions
         self.pre_physics_step(action_tensor)
+        # print('=== did the pre physics step ===')
 
         # step physics and render each frame
         for i in range(self.control_freq_inv):
             if self.force_render:
                 self.render()
             self.gym.simulate(self.sim)
+            
+        # print('=== finished simming! ===')
 
         # to fix!
         if self.device == 'cpu':
+            # print('=== doing sim on cpu! ===')
             self.gym.fetch_results(self.sim, True)
 
         # compute observations, rewards, resets, ...
         self.post_physics_step()
+        # print('=== finished post physics step! ===')
 
         # fill time out buffer: set to 1 if we reached the max episode length AND the reset buffer is 1. Timeout == 1 makes sense only if the reset buffer is 1.
         self.timeout_buf = (self.progress_buf >= self.max_episode_length - 1) & (self.reset_buf != 0)

@@ -26,7 +26,9 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import torch 
+import torch
+import numpy as np
+import time
 
 from rl_games.algos_torch import players
 from rl_games.algos_torch import torch_ext
@@ -51,8 +53,9 @@ class CommonPlayer(players.PpoPlayerContinuous):
         
         return
 
-    def run(self):
-        n_games = self.games_num
+    def run(self, total_games=None, log_data=False, save_path=None):
+        n_games = self.games_num if total_games is None else total_games
+        print(f'number of games: {n_games}')
         render = self.render_env
         n_game_life = self.n_game_life
         is_determenistic = self.is_determenistic
@@ -63,6 +66,14 @@ class CommonPlayer(players.PpoPlayerContinuous):
         games_played = 0
         has_masks = False
         has_masks_func = getattr(self.env, "has_action_mask", None) is not None
+        
+        # logging data utils
+        if log_data:
+            states = []
+            next_states = []
+            actions = []
+            rewards = []
+            dones = []
 
         op_agent = getattr(self.env, "create_agent", None)
         if op_agent:
@@ -97,13 +108,26 @@ class CommonPlayer(players.PpoPlayerContinuous):
                     action = self.get_masked_action(obs_dict, masks, is_determenistic)
                 else:
                     action = self.get_action(obs_dict, is_determenistic)
-                obs_dict, r, done, info =  self.env_step(self.env, action)
+                n_obs_dict, r, done, info =  self.env_step(self.env, action)
                 cr += r
                 steps += 1
+                
+                # add to states, actions, next_states
+                if log_data:
+                    assert 'obs' in obs_dict, 'weird dict issue with obs dict'
+                    states.append(obs_dict['obs'])
+                    next_states.append(n_obs_dict['obs'])
+                    actions.append(action)
+                    
+                    rewards.append(r)
+                    dones.append(done)
+                    
+                obs_dict = n_obs_dict
   
                 self._post_step(info)
 
                 if render:
+                    print('about to render')
                     self.env.render(mode = 'human')
                     time.sleep(self.render_sleep)
 
@@ -143,13 +167,30 @@ class CommonPlayer(players.PpoPlayerContinuous):
                     if batch_size//self.num_agents == 1 or games_played >= n_games:
                         break
 
-        print(sum_rewards)
+        # aggregate logged data
+        if log_data:
+            states = torch.cat(states, dim=0)
+            next_states = torch.cat(next_states, dim=0)
+            actions = torch.cat(actions, dim=0)
+            rewards = torch.cat(rewards, dim=0)
+            dones = torch.cat(dones, dim=0)
+            
+            print(f"Shapes (s, a, r, s', d): {states.size(), actions.size(), rewards.size(), next_states.size(), dones.size()}")
+        
+        print(f'sum_rewards: {sum_rewards}')
         if print_game_res:
             print('av reward:', sum_rewards / games_played * n_game_life, 'av steps:', sum_steps / games_played * n_game_life, 'winrate:', sum_game_res / games_played * n_game_life)
         else:
             print('av reward:', sum_rewards / games_played * n_game_life, 'av steps:', sum_steps / games_played * n_game_life)
 
-        return
+        if log_data:
+            print('about to log data!!!!!')
+            stuff = (states, actions, rewards, next_states, dones)
+            if save_path is not None:
+                torch.save(stuff, save_path)
+            return stuff
+        else:
+            return
 
     def obs_to_torch(self, obs):
         obs = super().obs_to_torch(obs)
