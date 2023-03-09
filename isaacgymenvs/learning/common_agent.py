@@ -44,7 +44,7 @@ from rl_games.common import schedulers
 from rl_games.common import vecenv
 
 import torch
-from torch import optim
+from torch import nn, optim
 
 from . import amp_datasets as amp_datasets
 
@@ -271,7 +271,7 @@ class CommonAgent(a2c_continuous.A2CAgent):
                 res_dict = self.get_action_values(self.obs)
 
             for k in update_list:
-                self.experience_buffer.update_data(k, n, res_dict[k]) 
+                self.experience_buffer.update_data(k, n, res_dict[k])
 
             if self.has_central_value:
                 self.experience_buffer.update_data('states', n, self.obs['states'])
