@@ -136,15 +136,17 @@ class PPOFixedDiscriminatorAgent(A2CAgent):
             # get discriminator rewards and combine like AMP
             assert 'amp_obs' in infos, "not an AMP env -- bad!"
             amp_rewards = self._calc_amp_rewards(infos['amp_obs'])
-            rewards = self._combine_rewards(rewards, amp_rewards)
+            print(f'task reward mean: {rewards.mean()}')
+            print(f'amp reward mean: {amp_rewards.mean()}')
+            combined_rewards = self._combine_rewards(rewards, amp_rewards)
 
-            shaped_rewards = self.rewards_shaper(rewards)
+            shaped_rewards = self.rewards_shaper(combined_rewards)
             if self.value_bootstrap and 'time_outs' in infos:
                 shaped_rewards += self.gamma * res_dict['values'] * self.cast_obs(infos['time_outs']).unsqueeze(1).float()
 
             self.experience_buffer.update_data('rewards', n, shaped_rewards)
 
-            self.current_rewards += rewards
+            self.current_rewards += rewards # task rewards only! -- important for evaluation
             self.current_lengths += 1
             all_done_indices = self.dones.nonzero(as_tuple=False)
             env_done_indices = self.dones.view(self.num_actors, self.num_agents).all(dim=1).nonzero(as_tuple=False)
