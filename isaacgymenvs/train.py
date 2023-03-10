@@ -57,6 +57,7 @@ def launch_rlg_hydra(cfg: DictConfig):
     from isaacgymenvs.learning import amp_models
     from isaacgymenvs.learning import amp_network_builder
     from isaacgymenvs.learning import dac_agent, dac_models, dac_network_builder, dac_player
+    from isaacgymenvs.learning import ppo_fixed_disc
     import isaacgymenvs
 
     time_str = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -145,6 +146,9 @@ def launch_rlg_hydra(cfg: DictConfig):
         runner.player_factory.register_builder('amp_dac', lambda **kwargs : dac_player.DACPlayer(**kwargs))
         model_builder.register_model('discriminator_actor_critic', lambda network, **kwargs : dac_models.ModelDACContinuous(network))
         model_builder.register_network('discriminator_actor_critic', lambda **kwargs : dac_network_builder.DACBuilder())
+        
+        # register PPO fixed discriminator components
+        runner.algo_factory.register_builder('ppo_fixed_disc', lambda **kwargs : ppo_fixed_disc.PPOFixedDiscriminatorAgent(**kwargs))
 
         return runner
 

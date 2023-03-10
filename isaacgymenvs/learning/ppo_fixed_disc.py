@@ -55,9 +55,10 @@ class PPOFixedDiscriminatorAgent(common_agent.CommonAgent):
             
             # change the rewards to the AMP agent-based discriminator ones
             amp_rewards = self._trained_agent._calc_amp_rewards(infos['amp_obs'])
+            assert amp_rewards.size() == rewards.size()
             rewards = self._trained_agent._combine_rewards(rewards, amp_rewards)
             
-            shaped_rewards = self.rewards_shaper(rewards) # just scaling rewards by something arbitrary
+            shaped_rewards = self.rewards_shaper(rewards) # just scaling rewards by something arbitrary (1.0)
             self.experience_buffer.update_data('rewards', n, shaped_rewards)
             self.experience_buffer.update_data('next_obses', n, self.obs['obs'])
             self.experience_buffer.update_data('dones', n, self.dones)
