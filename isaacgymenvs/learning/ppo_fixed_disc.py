@@ -3,7 +3,7 @@
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 from rl_games.algos_torch import torch_ext
 from rl_games.common import a2c_common
-from rl_games.algos_torch.model_builder import ModelBuilder
+from rl_games.algos_torch.a2c_continuous import A2CAgent
 
 import time
 from datetime import datetime
@@ -12,14 +12,23 @@ from torch import optim
 import torch 
 from torch import nn
 
-import isaacgymenvs.learning.common_agent as common_agent
 from isaacgymenvs.learning.amp_network_builder import AMPBuilder
 from isaacgymenvs.learning.amp_models import ModelAMPContinuous
 
-class PPOFixedDiscriminatorAgent(common_agent.CommonAgent):
+def swap_and_flatten01(arr):
+    """
+    swap and then flatten axes 0 and 1
+    """
+    if arr is None:
+        return arr
+    s = arr.size()
+    return arr.transpose(0, 1).reshape(s[0] * s[1], *s[2:])
+
+class PPOFixedDiscriminatorAgent(A2CAgent):
     '''PPO agent with reward coming from a fixed discriminator.'''
     def __init__(self, base_name, params):
         super().__init__(base_name, params)
+        self._load_config_params(self.config)
         
         if self.normalize_value:
             self.value_mean_std = self.central_value_net.model.value_mean_std if self.has_central_value else self.model.value_mean_std
@@ -39,13 +48,27 @@ class PPOFixedDiscriminatorAgent(common_agent.CommonAgent):
         self._amp_input_mean_std = RunningMeanStd(self._amp_observation_space.shape).to(self.ppo_device)
         self._amp_input_mean_std.load_state_dict(amp_trained_state['amp_input_mean_std'])
         
+        # for testing after init!
+        print('======== TESTING ========')
+        print(f'model type: {type(self.model)}')
+        print(f'network type: {type(self.model.a2c_network)}')
+        print('======== FINISHED TESTING ========')
+        
     def _build_amp_net_config(self):
-        config = self._build_net_config()
-        config['amp_input_shape'] = self._amp_observation_space.shape
-        return config
+        obs_shape = self.obs_shape
+        build_config = {
+            'actions_num' : self.actions_num,
+            'input_shape' : obs_shape,
+            'num_seqs' : self.num_actors * self.num_agents,
+            'value_size': self.env_info.get('value_size',1),
+            'normalize_value' : self.normalize_value,
+            'normalize_input': self.normalize_input,
+        }
+        build_config['amp_input_shape'] = self._amp_observation_space.shape
+        return build_config
     
     def _load_config_params(self, config):
-        super()._load_config_params(config)
+        # load amp specific config params
         
         self._task_reward_w = config['task_reward_w']
         self._disc_reward_w = config['disc_reward_w']
@@ -86,67 +109,67 @@ class PPOFixedDiscriminatorAgent(common_agent.CommonAgent):
     def play_steps(self):
         self.set_eval()
         
-        epinfos = []
         update_list = self.update_list
 
-        for n in range(self.horizon_length):
-            self.obs, done_env_ids = self._env_reset_done()
-            self.experience_buffer.update_data('obses', n, self.obs['obs'])
+        step_time = 0.0
 
+        for n in range(self.horizon_length):
             if self.use_action_masks:
                 masks = self.vec_env.get_action_masks()
                 res_dict = self.get_masked_action_values(self.obs, masks)
             else:
                 res_dict = self.get_action_values(self.obs)
+            self.experience_buffer.update_data('obses', n, self.obs['obs'])
+            self.experience_buffer.update_data('dones', n, self.dones)
 
             for k in update_list:
                 self.experience_buffer.update_data(k, n, res_dict[k]) 
-
             if self.has_central_value:
                 self.experience_buffer.update_data('states', n, self.obs['states'])
 
+            step_time_start = time.time()
             self.obs, rewards, self.dones, infos = self.env_step(res_dict['actions'])
-            
-            # change the rewards to the AMP agent-based discriminator ones
-            amp_rewards = self._calc_amp_rewards(infos['amp_obs'])
-            assert amp_rewards.size() == rewards.size()
-            rewards = self._combine_rewards(rewards, amp_rewards)
-            
-            shaped_rewards = self.rewards_shaper(rewards) # just scaling rewards by something arbitrary (1.0 here)
-            self.experience_buffer.update_data('rewards', n, shaped_rewards)
-            self.experience_buffer.update_data('next_obses', n, self.obs['obs'])
-            self.experience_buffer.update_data('dones', n, self.dones)
+            step_time_end = time.time()
 
-            terminated = infos['terminate'].float()
-            terminated = terminated.unsqueeze(-1)
-            next_vals = self._eval_critic(self.obs)
-            next_vals *= (1.0 - terminated)
-            self.experience_buffer.update_data('next_values', n, next_vals)
+            step_time += (step_time_end - step_time_start)
+            
+            # get rewards
+            assert 'amp_obs' in infos, "not an AMP env -- bad!"
+            amp_rewards = self._calc_amp_rewards(infos['amp_obs'])
+            rewards = self._combine_rewards(rewards, amp_rewards)
+
+            shaped_rewards = self.rewards_shaper(rewards)
+            if self.value_bootstrap and 'time_outs' in infos:
+                shaped_rewards += self.gamma * res_dict['values'] * self.cast_obs(infos['time_outs']).unsqueeze(1).float()
+
+            self.experience_buffer.update_data('rewards', n, shaped_rewards)
 
             self.current_rewards += rewards
             self.current_lengths += 1
             all_done_indices = self.dones.nonzero(as_tuple=False)
-            done_indices = all_done_indices[::self.num_agents]
-  
-            self.game_rewards.update(self.current_rewards[done_indices])
-            self.game_lengths.update(self.current_lengths[done_indices])
-            self.algo_observer.process_infos(infos, done_indices)
+            env_done_indices = self.dones.view(self.num_actors, self.num_agents).all(dim=1).nonzero(as_tuple=False)
+
+            self.game_rewards.update(self.current_rewards[env_done_indices])
+            self.game_lengths.update(self.current_lengths[env_done_indices])
+            self.algo_observer.process_infos(infos, env_done_indices)
 
             not_dones = 1.0 - self.dones.float()
 
             self.current_rewards = self.current_rewards * not_dones.unsqueeze(1)
             self.current_lengths = self.current_lengths * not_dones
 
+        last_values = self.get_values(self.obs)
+
+        fdones = self.dones.float()
         mb_fdones = self.experience_buffer.tensor_dict['dones'].float()
         mb_values = self.experience_buffer.tensor_dict['values']
-        mb_next_values = self.experience_buffer.tensor_dict['next_values']
         mb_rewards = self.experience_buffer.tensor_dict['rewards']
-        
-        mb_advs = self.discount_values(mb_fdones, mb_values, mb_rewards, mb_next_values)
+        mb_advs = self.discount_values(fdones, last_values, mb_fdones, mb_values, mb_rewards)
         mb_returns = mb_advs + mb_values
 
-        batch_dict = self.experience_buffer.get_transformed_list(a2c_common.swap_and_flatten01, self.tensor_list)
-        batch_dict['returns'] = a2c_common.swap_and_flatten01(mb_returns)
+        batch_dict = self.experience_buffer.get_transformed_list(swap_and_flatten01, self.tensor_list)
+        batch_dict['returns'] = swap_and_flatten01(mb_returns)
         batch_dict['played_frames'] = self.batch_size
+        batch_dict['step_time'] = step_time
 
         return batch_dict
