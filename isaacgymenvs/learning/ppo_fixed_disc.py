@@ -12,7 +12,8 @@ import torch
 from torch import nn
 
 import isaacgymenvs.learning.common_agent as common_agent
-from isaacgymenvs.learning.amp_continuous import AMPAgent
+from isaacgymenvs.learning.amp_network_builder import AMPBuilder
+from isaacgymenvs.learning.amp_models import ModelAMPContinuous
 
 class PPOFixedDiscriminatorAgent(common_agent.CommonAgent):
     '''PPO agent with reward coming from a fixed discriminator.'''
@@ -24,11 +25,64 @@ class PPOFixedDiscriminatorAgent(common_agent.CommonAgent):
             
         # no need for amp RMS bc we're not training discriminator here
     
-        # load AMP agent checkpoint
+        # load AMP agent checkpoint (aka rebuild everything bc making an agent is heinous af in this env)
         amp_chkpt_path = self.config['amp_chkpt_path']
-        self._trained_agent = AMPAgent(base_name, params)
-        self._trained_agent.restore(amp_chkpt_path)
+        amp_trained_state = self._load_amp_params(amp_chkpt_path)
         
+        amp_network_builder = AMPBuilder()
+        amp_model = ModelAMPContinuous(amp_network_builder)
+        self._amp_agent = amp_model.build(params['amp_model'])
+        self._amp_agent.load_state_dict(amp_trained_state['model'])
+        
+        # scaling amp input mean/std
+        self._amp_input_mean_std = RunningMeanStd(self._amp_observation_space.shape).to(self.ppo_device)
+        self._amp_input_mean_std.load_state_dict(amp_trained_state['amp_input_mean_std'])
+        
+    def _build_net_config(self):
+        # add amp input shape!
+        config = super()._build_net_config()
+        config['amp_input_shape'] = self._amp_observation_space.shape
+        return config
+    
+    def _load_config_params(self, config):
+        super()._load_config_params(config)
+        
+        self._task_reward_w = config['task_reward_w']
+        self._disc_reward_w = config['disc_reward_w']
+        self._disc_reward_scale = config['disc_reward_scale']
+        self._amp_observation_space = self.env_info['amp_observation_space']
+        self._normalize_amp_input = config.get('normalize_amp_input', True)
+        
+        return
+    
+    def _preproc_amp_obs(self, amp_obs):
+        if self._normalize_amp_input:
+            amp_obs = self._amp_input_mean_std(amp_obs)
+        return amp_obs
+        
+    # ========= amp params =========
+    def _load_amp_params(self, chkpt_path):
+        state = torch_ext.load_checkpoint(chkpt_path)
+        return state
+    
+    def _eval_disc(self, amp_obs):
+        # no need to preprocess I think
+        return self._amp_agent.a2c_network.eval_disc(amp_obs)
+    
+    # amp rewards
+    def _calc_amp_rewards(self, amp_obs: torch.Tensor) -> torch.Tensor:
+        amp_obs = self._preproc_amp_obs(amp_obs)
+        with torch.no_grad():
+            disc_logits = self._eval_disc(amp_obs)
+            prob = 1 / (1 + torch.exp(-disc_logits)) 
+            disc_r = -torch.log(torch.maximum(1 - prob, torch.tensor(0.0001, device=self.ppo_device)))
+            disc_r *= self._disc_reward_scale
+        return disc_r
+    
+    def _combine_rewards(self, task_rewards, amp_rewards):
+        return self._task_reward_w * task_rewards + self._disc_reward_w * amp_rewards
+    
+    # ========= modified training =========
     def play_steps(self):
         self.set_eval()
         
@@ -54,11 +108,11 @@ class PPOFixedDiscriminatorAgent(common_agent.CommonAgent):
             self.obs, rewards, self.dones, infos = self.env_step(res_dict['actions'])
             
             # change the rewards to the AMP agent-based discriminator ones
-            amp_rewards = self._trained_agent._calc_amp_rewards(infos['amp_obs'])
+            amp_rewards = self._calc_amp_rewards(infos['amp_obs'])
             assert amp_rewards.size() == rewards.size()
-            rewards = self._trained_agent._combine_rewards(rewards, amp_rewards)
+            rewards = self._combine_rewards(rewards, amp_rewards)
             
-            shaped_rewards = self.rewards_shaper(rewards) # just scaling rewards by something arbitrary (1.0)
+            shaped_rewards = self.rewards_shaper(rewards) # just scaling rewards by something arbitrary (1.0 here)
             self.experience_buffer.update_data('rewards', n, shaped_rewards)
             self.experience_buffer.update_data('next_obses', n, self.obs['obs'])
             self.experience_buffer.update_data('dones', n, self.dones)
