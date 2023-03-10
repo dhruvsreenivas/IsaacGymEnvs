@@ -77,11 +77,6 @@ class PPOFixedDiscriminatorAgent(A2CAgent):
         self._normalize_amp_input = config.get('normalize_amp_input', True)
         
         return
-    
-    def _preproc_amp_obs(self, amp_obs):
-        if self._normalize_amp_input:
-            amp_obs = self._amp_input_mean_std(amp_obs)
-        return amp_obs
         
     # ========= amp params =========
     def _load_amp_params(self, chkpt_path):
@@ -91,6 +86,11 @@ class PPOFixedDiscriminatorAgent(A2CAgent):
     def _eval_disc(self, amp_obs):
         # no need to preprocess I think
         return self._amp_agent.a2c_network.eval_disc(amp_obs)
+    
+    def _preproc_amp_obs(self, amp_obs):
+        if self._normalize_amp_input:
+            amp_obs = self._amp_input_mean_std(amp_obs)
+        return amp_obs
     
     # amp rewards
     def _calc_amp_rewards(self, amp_obs: torch.Tensor) -> torch.Tensor:
@@ -133,7 +133,7 @@ class PPOFixedDiscriminatorAgent(A2CAgent):
 
             step_time += (step_time_end - step_time_start)
             
-            # get rewards
+            # get discriminator rewards and combine like AMP
             assert 'amp_obs' in infos, "not an AMP env -- bad!"
             amp_rewards = self._calc_amp_rewards(infos['amp_obs'])
             rewards = self._combine_rewards(rewards, amp_rewards)
