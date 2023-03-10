@@ -3,6 +3,7 @@
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 from rl_games.algos_torch import torch_ext
 from rl_games.common import a2c_common
+from rl_games.algos_torch.model_builder import ModelBuilder
 
 import time
 from datetime import datetime
@@ -22,25 +23,24 @@ class PPOFixedDiscriminatorAgent(common_agent.CommonAgent):
         
         if self.normalize_value:
             self.value_mean_std = self.central_value_net.model.value_mean_std if self.has_central_value else self.model.value_mean_std
-            
-        # no need for amp RMS bc we're not training discriminator here
     
         # load AMP agent checkpoint (aka rebuild everything bc making an agent is heinous af in this env)
         amp_chkpt_path = self.config['amp_chkpt_path']
         amp_trained_state = self._load_amp_params(amp_chkpt_path)
         
-        amp_network_builder = AMPBuilder()
-        amp_model = ModelAMPContinuous(amp_network_builder)
-        self._amp_agent = amp_model.build(params['amp_model'])
+        amp_network = AMPBuilder()
+        amp_network.load(params['amp_network'])
+        amp_model = ModelAMPContinuous(amp_network)
+        net_config = self._build_amp_net_config()
+        self._amp_agent = amp_model.build(net_config).to(self.ppo_device)
         self._amp_agent.load_state_dict(amp_trained_state['model'])
         
         # scaling amp input mean/std
         self._amp_input_mean_std = RunningMeanStd(self._amp_observation_space.shape).to(self.ppo_device)
         self._amp_input_mean_std.load_state_dict(amp_trained_state['amp_input_mean_std'])
         
-    def _build_net_config(self):
-        # add amp input shape!
-        config = super()._build_net_config()
+    def _build_amp_net_config(self):
+        config = self._build_net_config()
         config['amp_input_shape'] = self._amp_observation_space.shape
         return config
     
